@@ -170,13 +170,13 @@ class Mamba(nn.Module):
                         result = torch.cat((result, out), dim=1) 
                 
                 
-                if self.count==13:
-                    #conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-                    self.count = 0
-                    self.ssm_state=None
-                    self.conv_state=None
-                #print(self.count)
-                return result
+                    if self.count==400:
+                        #conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+                        self.count = 0
+                        self.ssm_state=None
+                        self.conv_state=None
+                    #print(self.count)
+                    return result
         
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
