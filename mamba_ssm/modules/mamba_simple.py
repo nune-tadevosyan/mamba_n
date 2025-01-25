@@ -9,16 +9,16 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from einops import rearrange, repeat
-
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, selective_scan_ref
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_update_ref, causal_conv1d_fn, causal_conv1d_ref, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
 try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update 
 except ImportError:
     selective_state_update = None
 
@@ -54,6 +54,7 @@ class Mamba(nn.Module):
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
+        self.cache = None
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
@@ -78,6 +79,8 @@ class Mamba(nn.Module):
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.ssm_state = None
+        self.conv_state=None
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
@@ -113,6 +116,7 @@ class Mamba(nn.Module):
         # D "skip" parameter
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
+        self.count  = 0 
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
@@ -120,17 +124,60 @@ class Mamba(nn.Module):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
+        
         """
         batch, seqlen, dim = hidden_states.shape
 
-        conv_state, ssm_state = None, None
+        #conv_state, ssm_state = None, None
+        ssm_state= None
+        conv_state =None
         if inference_params is not None:
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-            if inference_params.seqlen_offset > 0:
-                # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
-                return out
+            if self.ssm_state is  None:
+                self.ssm_state = ssm_state
+                self.conv_state = conv_state
+            inference_params.seqlen_offset=1
 
+            result = None   
+            if inference_params.seqlen_offset > 0:
+    
+                # out, self.conv_state, self.ssm_state = self.step(hidden_states, self.conv_state, self.ssm_state)
+                # return out
+                # The states are updated inplace
+                #
+                if self.ssm_state is  None:
+                    
+                    self.ssm_state = ssm_state
+                    self.conv_state = conv_state
+                self.count += 1
+                for i in range(seqlen):
+                    #self.count += 1
+                    
+                    #print("hello")
+                    conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+                    if self.ssm_state is  None:
+                        self.ssm_state = ssm_state
+                        self.conv_state = conv_state
+    
+                    out, self.conv_state, self.ssm_state = self.step(hidden_states[:, i : i + 1, :], self.conv_state, self.ssm_state)
+                    #inference_params.seqlen_offset += 1
+                    if result is None:
+                        result = out  # Initialize with the first tensor
+                        dtype_to_use = out.dtype  # Capture the dtype of the first tensor
+                    else:
+                        if out.dtype != result.dtype:   
+                            out = out.to(result.dtype)
+                        result = torch.cat((result, out), dim=1) 
+                
+                
+                    if self.count==400:
+                        #conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+                        self.count = 0
+                        self.ssm_state=None
+                        self.conv_state=None
+                    #print(self.count)
+                    return result
+        
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
@@ -142,6 +189,7 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+
         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
@@ -159,33 +207,72 @@ class Mamba(nn.Module):
                 delta_softplus=True,
             )
         else:
+           # print("should do correctly")
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+            if self.conv_state is not None:
+                conv_state = self.conv_state
+            # if conv_state is not None:
+            #     # print("conv_state is not none")
+            #     # print(conv_state)
+            #     # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            #     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            #     conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+            #     self.conv_state=conv_state
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
+                
                 assert self.activation in ["silu", "swish"]
+                x,self.conv_state = causal_conv1d_ref(
+                    x=x,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    initial_states= self.conv_state,
+                    return_final_states=True,
+                    activation=self.activation,
+                )
+                if self.conv_state  is not None:
+                    cache_conv_copy = (F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+                    x = causal_conv1d_update(
+                        x,
+                        self.conv_state,
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        self.conv1d.bias,
+                        self.activation,
+                    )
+                    self.conv_state  = cache_conv_copy
+                else:
+                    x = causal_conv1d_fn(
+                        x=x,
+                        weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                    )
                 x = causal_conv1d_fn(
                     x=x,
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
+                    initial_states= self.conv_state,
                     activation=self.activation,
                 )
+            
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
             x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+
             dt = self.dt_proj.weight @ dt.t()
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
+            if self.ssm_state is not None:
+                ssm_state = self.ssm_state 
+            
+
             y = selective_scan_fn(
                 x,
                 dt,
@@ -198,12 +285,32 @@ class Mamba(nn.Module):
                 delta_softplus=True,
                 return_last_state=ssm_state is not None,
             )
+            #one or the other 
+            # y = selective_scan_ref(
+            #     x,
+            #     dt,
+            #     A,
+            #     B,
+            #     C,
+            #     self.D.float(),
+            #     z=z,
+            #     delta_bias=self.dt_proj.bias.float(),
+            #     delta_softplus=True,
+            #     initial_state = self.ssm_state,
+                
+            #     return_last_state=ssm_state is not None,
+            # )
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
+           
+            self.ssm_state = ssm_state
             out = self.out_proj(y)
+            # print("returning  out")
+            
         return out
+
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
@@ -292,3 +399,119 @@ class Mamba(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+        
+
+class MambaVision(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        dt_rank="auto",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        conv_bias=True,
+        bias=False,
+        use_fast_path=False,  # Fused kernel options
+        layer_idx=None,
+        device=None,
+        dtype=None 
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.use_fast_path = use_fast_path
+        self.layer_idx = layer_idx
+        self.cache = None
+        self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)    
+        self.x_proj = nn.Linear(
+            self.d_inner//2, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner//2, bias=True, **factory_kwargs)
+        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+        dt = torch.exp(
+            torch.rand(self.d_inner//2, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner//2,
+        ).contiguous()
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+        self.D = nn.Parameter(torch.ones(self.d_inner//2, device=device))
+        self.D._no_weight_decay = True
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.conv1d_x = nn.Conv1d(
+            in_channels=self.d_inner//2,
+            out_channels=self.d_inner//2,
+            bias=conv_bias//2,
+            kernel_size=d_conv,
+            groups=self.d_inner//2,
+            **factory_kwargs,
+        )
+        self.conv1d_z = nn.Conv1d(
+            in_channels=self.d_inner//2,
+            out_channels=self.d_inner//2,
+            bias=conv_bias//2,
+            kernel_size=d_conv,
+            groups=self.d_inner//2,
+            **factory_kwargs,
+        )
+    def forward(self, hidden_states, inference_params=None):
+        """
+        hidden_states: (B, L, D)
+        Returns: same shape as hidden_states
+        """
+        _, seqlen, _ = hidden_states.shape
+        xz = self.in_proj(hidden_states)
+        xz = rearrange(xz, "b l d -> b d l")
+        x, z = xz.chunk(2, dim=1)
+        A = -torch.exp(self.A_log.float())
+        x = F.silu(F.conv1d(input=x, weight=self.conv1d_x.weight, bias=self.conv1d_x.bias, padding='same', groups=self.d_inner//2))
+        z = F.silu(F.conv1d(input=z, weight=self.conv1d_z.weight, bias=self.conv1d_z.bias, padding='same', groups=self.d_inner//2))
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        y, last_state = selective_scan_fn(x,
+                              dt,
+                              A,
+                              B,
+                              C,
+                              self.D.float(),
+                              z=None,
+                              delta_bias=self.dt_proj.bias.float(),
+                              delta_softplus=True,
+                              return_last_state=True,
+                              initial_state= self.cache  )
+        self.cache = last_state
+        y = torch.cat([y, z], dim=1)
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
+
+        return out
+
+   

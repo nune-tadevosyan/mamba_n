@@ -31,10 +31,8 @@ from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
-from huggingface_hub import PyTorchModelHubMixin
 
-
-class Mamba2(nn.Module, PyTorchModelHubMixin):
+class Mamba2(nn.Module):
     def __init__(
         self,
         d_model,
@@ -230,7 +228,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
                 assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
                 xBC = self.act(
-                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
+                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, -(self.dconv - 1):]
                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
             else:
                 xBC = causal_conv1d_fn(
