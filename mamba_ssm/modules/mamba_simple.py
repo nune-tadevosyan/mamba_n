@@ -1,19 +1,16 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 from einops import rearrange, repeat
-from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, selective_scan_ref
+from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_ref
 
 try:
-    from causal_conv1d import causal_conv1d_update_ref, causal_conv1d_fn, causal_conv1d_update, causal_conv1d_ref
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
@@ -21,12 +18,6 @@ try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update 
 except ImportError:
     selective_state_update = None
-
-try:
-    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
-except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
 
 class Mamba(nn.Module):
     def __init__(
@@ -80,7 +71,7 @@ class Mamba(nn.Module):
         )
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
         self.ssm_state = None
-        self.conv_state=None
+        self.conv_state = None
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
@@ -126,12 +117,7 @@ class Mamba(nn.Module):
         Returns: same shape as hidden_states
         
         """
-        batch, seqlen, dim = hidden_states.shape
-
-        #conv_state, ssm_state = None, None
-        ssm_state= None
-        conv_state =None
-        #import pdb; pdb.set_trace()
+        batch, seqlen, _ = hidden_states.shape
     
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
@@ -162,52 +148,23 @@ class Mamba(nn.Module):
                 delta_softplus=True,
             )
         else:
-           # print("should do correctly")
             x, z = xz.chunk(2, dim=1)
-            # Compute short convolution
-            state_len = self.d_conv - 1
-            if state_len > 0:
-                if (
-                    self.conv_state is None
-                    or self.conv_state.shape[0] != batch
-                    or self.conv_state.shape[1] != x.shape[1]
-                ):
-                    # Keep the convolution cache in sync with the current batch layout.
-                    self.conv_state = x.new_zeros(batch, x.shape[1], state_len)
-            else:
-                self.conv_state = None
-            if self.conv_state is not None:
-                conv_state = self.conv_state
-            # if conv_state is not None:
-            #     # print("conv_state is not none")
-            #     # print(conv_state)
-            #     # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-            #     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-            #     conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-            #     self.conv_state=conv_state
+            conv_state = self._prepare_conv_state(x, batch)
+
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
-                
                 assert self.activation in ["silu", "swish"]
-                # x,self.conv_state = causal_conv1d_ref(
-                #     x=x,
-                #     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                #     bias=self.conv1d.bias,
-                #     initial_states= self.conv_state,
-                #     return_final_states=True,
-                #     activation=self.activation,
-                # )
-                if self.conv_state  is not None:
-                    cache_conv_copy = (F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+                if conv_state is not None:
+                    new_state = F.pad(x, (self.d_conv - x.shape[-1], 0))
                     x = causal_conv1d_update(
                         x,
-                        self.conv_state,
+                        conv_state,
                         rearrange(self.conv1d.weight, "d 1 w -> d w"),
                         self.conv1d.bias,
                         self.activation,
                     )
-                    self.conv_state  = cache_conv_copy
+                    self.conv_state = new_state
                 else:
                     x = causal_conv1d_fn(
                         x=x,
@@ -215,19 +172,8 @@ class Mamba(nn.Module):
                         bias=self.conv1d.bias,
                         activation=self.activation,
                     )
-                # x = causal_conv1d_fn(
-                #     x=x,
-                #     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                #     bias=self.conv1d.bias,
-                #     initial_states= self.conv_state,
-                #     activation=self.activation,
-                # )
-            
 
-            # We're careful here about the layout, to avoid extra transposes.
-            # We want dt to have d as the slowest moving dimension
-            # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
 
             dt = self.dt_proj.weight @ dt.t()
@@ -235,14 +181,8 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            #self.ssm_state=None
-            # if self.ssm_state is not None:
-            #     print("not none")
-            #     ssm_state = self.ssm_state 
-            
-            # else:
-            #     print("noneisnone noneisnone noneisnonenoneisnonenoneisnonenoneisnonenoneisnonenoneisnone")
-            y = selective_scan_ref(
+
+            scan_output = selective_scan_ref(
                 x,
                 dt,
                 A,
@@ -252,24 +192,17 @@ class Mamba(nn.Module):
                 z=z,
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
-                initial_state = self.ssm_state,
-                return_last_state=True, #ssm_state is not None,
+                initial_state=self.ssm_state,
+                return_last_state=True,
             )
-            #import pdb; pdb.set_trace()
-            # if ssm_state is not None:
-            #import pdb; pdb.set_trace()
-            if isinstance(y,tuple):
-                y, last_state = y
-                self.ssm_state =last_state
+            if isinstance(scan_output, tuple):
+                y, self.ssm_state = scan_output
             else:
-                last_state=None
-            
+                y = scan_output
+
             y = rearrange(y, "b d l -> b l d")
-            # if ssm_state is not None:
-            #     import pdb; pdb.set_trace()
             out = self.out_proj(y)
-            # print("returning  out")
-            
+
         return out
 
 
@@ -335,7 +268,6 @@ class Mamba(nn.Module):
 
     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
         assert self.layer_idx is not None
-       # import pdb; pdb.set_trace()
         if self.layer_idx not in inference_params.key_value_memory_dict:
             batch_shape = (batch_size,)
             conv_state = torch.zeros(
@@ -361,4 +293,17 @@ class Mamba(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+    def _prepare_conv_state(self, x, batch_size):
+        state_len = self.d_conv - 1
+        if state_len <= 0:
+            self.conv_state = None
+            return None
+        if (
+            self.conv_state is None
+            or self.conv_state.shape[0] != batch_size
+            or self.conv_state.shape[1] != x.shape[1]
+        ):
+            self.conv_state = x.new_zeros(batch_size, x.shape[1], state_len)
+        return self.conv_state
         
