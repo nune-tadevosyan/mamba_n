@@ -159,6 +159,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             (in case batch is small).
         Returns: same shape as u
         """
+        import pdb; pdb.set_trace()
         seqlen_og = seqlen
         if seqlen is None:
             batch, seqlen, dim = u.shape
