@@ -91,6 +91,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
+        self.ssm_state = None
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -159,13 +160,18 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             (in case batch is small).
         Returns: same shape as u
         """
-        import pdb; pdb.set_trace()
         seqlen_og = seqlen
+        #import pdb; pdb.set_trace()
+        cache_device = self.in_proj.weight.device
+        cache_dtype = self.in_proj.weight.dtype
         if seqlen is None:
             batch, seqlen, dim = u.shape
         else:
             batch_seqlen, dim = u.shape
             batch = batch_seqlen // seqlen
+
+        should_cache_states = inference_params is None and cu_seqlens is None
+        cached_state = self._maybe_get_cached_state(batch, cache_device, cache_dtype) if should_cache_states else None
 
         conv_state, ssm_state = None, None
         if inference_params is not None:
@@ -183,6 +189,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
+            return_final_states = should_cache_states
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
@@ -200,8 +207,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 headdim=None if self.D_has_hdim else self.headdim,
                 ngroups=self.ngroups,
                 norm_before_gate=self.norm_before_gate,
+                initial_states=cached_state,
+                return_final_states=return_final_states,
                 **dt_limit_kwargs,
             )
+            if return_final_states:
+                out, final_states = out
+                if should_cache_states and seqlen > 0:
+                    self._update_cache_state(final_states)
             if seqlen_og is not None:
                 out = rearrange(out, "b l d -> (b l) d")
             if self.process_group is not None:
@@ -242,6 +255,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            return_varlen_states = cu_seqlens is not None and inference_params is not None
+            initial_states = ssm_state if ssm_state is not None else cached_state
+            return_final_states = (ssm_state is not None) or should_cache_states
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -256,16 +272,24 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 seq_idx=seq_idx,
                 cu_seqlens=cu_seqlens,
                 **dt_limit_kwargs,
-                return_final_states=ssm_state is not None,
-                return_varlen_states=cu_seqlens is not None and inference_params is not None,
+                return_final_states=return_final_states,
+                return_varlen_states=return_varlen_states,
+                initial_states=initial_states,
             )
-            if ssm_state is not None:
-                y, last_state, *rest = y
-                if cu_seqlens is None:
-                    ssm_state.copy_(last_state)
-                else:
+            if return_final_states:
+                if return_varlen_states:
+                    y, last_state, *rest = y
                     varlen_states = rest[0]
-                    ssm_state.copy_(varlen_states)
+                else:
+                    y, last_state = y
+                    varlen_states = None
+                if ssm_state is not None:
+                    if cu_seqlens is None:
+                        ssm_state.copy_(last_state)
+                    else:
+                        ssm_state.copy_(varlen_states)
+                if should_cache_states and cu_seqlens is None and seqlen > 0:
+                    self._update_cache_state(last_state)
             y = rearrange(y, "b l h p -> b l (h p)")
             if self.rmsnorm:
                 y = self.norm(y, z)
@@ -382,3 +406,24 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+    def reset_cache(self):
+        self.ssm_state = None
+
+    def _maybe_get_cached_state(self, batch_size, device, dtype):
+        if self.ssm_state is None:
+            return None
+        if self.ssm_state.shape[0] != batch_size or self.ssm_state.device != device or self.ssm_state.dtype != dtype:
+            self.ssm_state = None
+            return None
+        return self.ssm_state
+
+    def _update_cache_state(self, new_state):
+        if new_state is None:
+            self.ssm_state = None
+            return
+        cache_state = new_state.detach()
+        target_dtype = self.in_proj.weight.dtype
+        if cache_state.dtype != target_dtype:
+            cache_state = cache_state.to(dtype=target_dtype)
+        self.ssm_state = cache_state.contiguous()
