@@ -127,7 +127,6 @@ class Mamba2Simple(nn.Module):
         Returns: same shape as u
         """
         batch, seqlen, dim = u.shape
-        import pdb; pdb.set_trace()
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None

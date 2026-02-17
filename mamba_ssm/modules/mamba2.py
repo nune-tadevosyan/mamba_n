@@ -92,6 +92,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
         self.ssm_state = None
+        self.conv_state = None
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -161,7 +162,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         Returns: same shape as u
         """
         seqlen_og = seqlen
-        #import pdb; pdb.set_trace()
         cache_device = self.in_proj.weight.device
         cache_dtype = self.in_proj.weight.dtype
         if seqlen is None:
@@ -170,18 +170,11 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             batch_seqlen, dim = u.shape
             batch = batch_seqlen // seqlen
 
-        should_cache_states = inference_params is None and cu_seqlens is None
+        should_cache_states = inference_params is not None
         cached_state = self._maybe_get_cached_state(batch, cache_device, cache_dtype) if should_cache_states else None
 
         conv_state, ssm_state = None, None
-        if inference_params is not None:
-            inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
-            conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
-            if inference_params.seqlen_offset > 0:
-                # The states are updated inplace
-                out, _, _ = self.step(u, conv_state, ssm_state)
-                return out
-
+        
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
         if seqlen_og is not None:
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
@@ -227,12 +220,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
                 dim=-1
             )
+            
+            assert self.activation in ["silu", "swish"]
+            conv_state = self._prepare_conv_state(xBC.transpose(1, 2), batch)
             if conv_state is not None:
                 if cu_seqlens is None:
                     # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                     xBC_t = rearrange(xBC, "b l d -> b d l")
-                    conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
+                    self.conv_state = F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0))  # Update state (B D W)
                 else:
                     assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
                     assert batch == 1, "varlen inference only supports batch dimension 1"
@@ -240,21 +236,21 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
                     conv_state.copy_(conv_varlen_states)
-            assert self.activation in ["silu", "swish"]
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
                 assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
                 xBC = self.act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
             else:
-                xBC = causal_conv1d_fn(
+                xBC = causal_conv1d_update(
                     xBC.transpose(1, 2),
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    conv_state=conv_state,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+
             return_varlen_states = cu_seqlens is not None and inference_params is not None
             initial_states = ssm_state if ssm_state is not None else cached_state
             return_final_states = (ssm_state is not None) or should_cache_states
@@ -409,6 +405,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
     def reset_cache(self):
         self.ssm_state = None
+        self.conv_state = None
 
     def _maybe_get_cached_state(self, batch_size, device, dtype):
         if self.ssm_state is None:
@@ -427,3 +424,17 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if cache_state.dtype != target_dtype:
             cache_state = cache_state.to(dtype=target_dtype)
         self.ssm_state = cache_state.contiguous()
+
+    def _prepare_conv_state(self, x, batch_size):
+        state_len = self.d_conv - 1
+        if state_len <= 0:
+            self.conv_state = None
+            return None
+        if (
+            self.conv_state is None
+            or self.conv_state.shape[0] != batch_size
+            or self.conv_state.shape[1] != x.shape[1]
+        ):
+            self.conv_state = x.new_zeros(batch_size, x.shape[1], state_len)
+        return self.conv_state
+        
